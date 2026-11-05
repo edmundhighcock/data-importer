@@ -64,6 +64,14 @@ final class ApiSubmitter
     private ImportJob $importJob;
     private ImportJobRepository $repository;
 
+    /**
+     * Set whenever performSearch() or countFieldMatches() catches an ApiHttpException, so
+     * that the resulting "could not check for duplicates" error message (see
+     * addDuplicateCheckFailedError()) can quote what actually went wrong. Read only
+     * immediately after a call that is known, from its return value, to have just failed.
+     */
+    private ?string $lastApiError = null;
+
     public function setImportJob(ImportJob $importJob): void
     {
         $importJob->refreshInstanceIdentifier();
@@ -211,6 +219,14 @@ final class ApiSubmitter
                 Log::debug(sprintf('Duplicate detection for this transaction is scoped to account #%d.', $accountId));
             }
             $searchResult = $this->searchField($field, $value, $accountId);
+            if (false === $searchResult) {
+                // The search itself could not be performed (API error): we do not know
+                // whether this is a duplicate, so it must NOT be imported on the strength
+                // of a guess. Distinct from "not found" (null) and from "found" (array).
+                $this->addDuplicateCheckFailedError($index, $field, $value);
+
+                return false;
+            }
             if (null !== $searchResult) {
                 Log::debug(sprintf(
                     'Looks like field "%s" with value "%s" is not unique, found in group #%d. Return false',
@@ -242,6 +258,13 @@ final class ApiSubmitter
             $exists       = null !== $accountId
                 ? $this->deletedTransactionExistsElsewhere($field, $value)
                 : $this->searchFieldUsingCount($field, $value);
+            if (null === $exists) {
+                // Same tri-state rule as above: a failed count check is "unknown", not
+                // "no duplicate" and not "duplicate" - it must not be guessed either way.
+                $this->addDuplicateCheckFailedError($index, $field, $value);
+
+                return false;
+            }
             if ($exists) {
                 Log::debug(sprintf('Looks like field "%s" with value "%s" is not unique, found in a deleted transaction group. Return false', $field, $value));
                 $message = sprintf('[a115]: There is already a (deleted) transaction with %s "%s", so this transaction will be skipped.', e($field), e($value));
@@ -283,12 +306,18 @@ final class ApiSubmitter
     }
 
     /**
-     * Do a search at Firefly III and return the ID of the group found.
+     * Do a search at Firefly III and return the ID of the group found. Three distinct
+     * outcomes, all explicit in the return value: an array means a match was found; null
+     * means the search succeeded and found nothing; false means the search could not be
+     * performed at all (API error) and uniqueness is therefore UNKNOWN, not "no match".
      */
-    private function searchField(string $field, string $value, ?int $accountId = null): ?array
+    private function searchField(string $field, string $value, ?int $accountId = null): array|false|null
     {
         $response       = $this->performSearch($field, $value, $accountId);
-        if (null === $response || 0 === $response->count()) {
+        if (null === $response) {
+            return false;
+        }
+        if (0 === $response->count()) {
             return null;
         }
         $first          = $response->current();
@@ -331,10 +360,29 @@ final class ApiSubmitter
             /** @var GetTransactionsResponse $response */
             return $request->get();
         } catch (ApiHttpException $e) {
+            $this->lastApiError = $e->getMessage();
             Log::error(sprintf('[%s]: %s', config('importer.version'), $e->getMessage()));
 
             return null;
         }
+    }
+
+    /**
+     * Builds and records the distinct "could not check for duplicates" error (a116). Unlike
+     * the a115 duplicate messages, this is always added regardless of
+     * importer.ignore_duplicate_errors: it is not reporting a duplicate, it is reporting that
+     * uniqueness could not be determined at all, which the user needs to know about either way.
+     */
+    private function addDuplicateCheckFailedError(int $index, string $field, string $value): void
+    {
+        $message = sprintf(
+            '[a116]: Could not check for duplicates of transaction with %s "%s" (Firefly III API error: %s); it was not imported. Run the import again to retry.',
+            e($field),
+            e($value),
+            e($this->lastApiError ?? 'unknown error')
+        );
+        Log::warning($message);
+        $this->importJob->submissionStatus->addError($index, $message);
     }
 
     /**
@@ -344,39 +392,55 @@ final class ApiSubmitter
      * ledger-wide count (live + deleted) against a ledger-wide LIVE count. If the former
      * is larger, a deleted duplicate exists somewhere and the transaction is skipped,
      * exactly as the unscoped path already does today - scoping never gives a deleted
-     * duplicate on the same account a new way to slip through.
+     * duplicate on the same account a new way to slip through. Returns null, rather than
+     * guessing either way, if either API call needed to answer the question fails.
      */
-    private function deletedTransactionExistsElsewhere(string $field, string $value): bool
+    private function deletedTransactionExistsElsewhere(string $field, string $value): ?bool
     {
         $totalCount = $this->countFieldMatches($field, $value);
         if (null === $totalCount) {
-            // API error: stay conservative, same as searchFieldUsingCount() does.
-            return true;
+            return null;
         }
         if (0 === $totalCount) {
             return false;
         }
         $liveResponse = $this->performSearch($field, $value, null);
-        $liveCount    = $liveResponse?->count() ?? 0;
+        $liveCount    = $liveResponse?->count();
         Log::debug(sprintf(
-            'Scoped duplicate detection: ledger-wide count (incl. deleted) for %s:%s is %d, ledger-wide live count is %d.',
+            'Scoped duplicate detection: ledger-wide count (incl. deleted) for %s:%s is %d, ledger-wide live count is %s.',
             $field,
             $value,
             $totalCount,
-            $liveCount
+            null === $liveCount ? 'unknown (API error)' : (string) $liveCount
         ));
+
+        return $this->hasDeletedDuplicate($totalCount, $liveCount);
+    }
+
+    /**
+     * Pure decision logic behind deletedTransactionExistsElsewhere(), pulled out so it can be
+     * unit-tested without a live API: a deleted duplicate exists elsewhere if the ledger-wide
+     * count (live + deleted) exceeds the ledger-wide live count. Either count being null means
+     * the API call that would have produced it failed, so the answer is unknown, not "no".
+     */
+    private function hasDeletedDuplicate(?int $totalCount, ?int $liveCount): ?bool
+    {
+        if (null === $totalCount || null === $liveCount) {
+            return null;
+        }
 
         return $totalCount > $liveCount;
     }
 
     /**
-     * Do a search at Firefly III and return the ID of the group found.
+     * Do a search at Firefly III and return the ID of the group found. Returns null, rather
+     * than assuming a duplicate, if the underlying count check fails.
      */
-    private function searchFieldUsingCount(string $field, string $value): bool
+    private function searchFieldUsingCount(string $field, string $value): ?bool
     {
         $count = $this->countFieldMatches($field, $value);
         if (null === $count) {
-            return true;
+            return null;
         }
         Log::debug(sprintf('The search returned count: %d', $count));
 
@@ -425,6 +489,7 @@ final class ApiSubmitter
             /** @var GetCountTransactionsResponse $response */
             $response = $request->get();
         } catch (ApiHttpException $e) {
+            $this->lastApiError = $e->getMessage();
             Log::error(sprintf('[%s]: %s', config('importer.version'), $e->getMessage()));
 
             return null;
