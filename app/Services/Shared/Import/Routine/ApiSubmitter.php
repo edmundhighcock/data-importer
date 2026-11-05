@@ -193,6 +193,7 @@ final class ApiSubmitter
             $field = 'external_id';
         }
         $value        = '';
+        $scopeToAccount = (bool) config('importer.duplicate_detection_scope_to_account');
         foreach ($transactions as $transactionIndex => $transaction) {
             $value        = (string) ($transaction[$field] ?? '');
             if ('' === $value) {
@@ -205,7 +206,11 @@ final class ApiSubmitter
 
                 continue;
             }
-            $searchResult = $this->searchField($field, $value);
+            $accountId    = $scopeToAccount ? $this->ownAccountId($transaction) : null;
+            if (null !== $accountId) {
+                Log::debug(sprintf('Duplicate detection for this transaction is scoped to account #%d.', $accountId));
+            }
+            $searchResult = $this->searchField($field, $value, $accountId);
             if (null !== $searchResult) {
                 Log::debug(sprintf(
                     'Looks like field "%s" with value "%s" is not unique, found in group #%d. Return false',
@@ -229,8 +234,14 @@ final class ApiSubmitter
 
                 return false;
             }
-            // could still be not unique because of deleted values.
-            $exists       = $this->searchFieldUsingCount($field, $value);
+            // could still be not unique because of deleted values. When the search above was
+            // scoped to an account, a miss there only rules out a LIVE duplicate on that one
+            // account; the count endpoint has no account parameter, so the deleted-transaction
+            // check below falls back to a ledger-wide comparison instead, to stay exactly as
+            // conservative as the unscoped path.
+            $exists       = null !== $accountId
+                ? $this->deletedTransactionExistsElsewhere($field, $value)
+                : $this->searchFieldUsingCount($field, $value);
             if ($exists) {
                 Log::debug(sprintf('Looks like field "%s" with value "%s" is not unique, found in a deleted transaction group. Return false', $field, $value));
                 $message = sprintf('[a115]: There is already a (deleted) transaction with %s "%s", so this transaction will be skipped.', e($field), e($value));
@@ -247,32 +258,37 @@ final class ApiSubmitter
     }
 
     /**
-     * Do a search at Firefly III and return the ID of the group found.
+     * Work out which Firefly III asset account this line's OWN leg belongs to, so the
+     * duplicate search can be scoped to it. Returns null (= fall back to the unscoped,
+     * ledger-wide search) when the type is not one we recognise, or no usable numeric
+     * account id is present yet (name-only accounts are resolved later, in cleanupLine()).
      */
-    private function searchField(string $field, string $value): ?array
+    private function ownAccountId(array $transaction): ?int
     {
-        // search for the exact description and not just a part of it:
-        $searchModifier = config(sprintf('csv.search_modifier.%s', $field));
-        $query          = sprintf('%s:"%s"', $searchModifier, $value);
-
-        Log::debug(sprintf('Going to search for %s:%s using query %s', $field, $value, $query));
-
-        $url            = SecretManager::getBaseUrl();
-        $token          = SecretManager::getAccessToken();
-        $request        = new GetSearchTransactionsRequest($url, $token);
-        $request->setTimeOut(config('importer.connection.timeout'));
-        $request->setVerify(config('importer.connection.verify'));
-        $request->setQuery($query);
-
-        try {
-            /** @var GetTransactionsResponse $response */
-            $response = $request->get();
-        } catch (ApiHttpException $e) {
-            Log::error(sprintf('[%s]: %s', config('importer.version'), $e->getMessage()));
-
+        $type = (string) ($transaction['type'] ?? '');
+        $key  = match ($type) {
+            'withdrawal', 'transfer' => 'source_id',
+            'deposit'                => 'destination_id',
+            default                  => null,
+        };
+        if (null === $key) {
             return null;
         }
-        if (0 === $response->count()) {
+        $value = $transaction[$key] ?? null;
+        if (null === $value || '' === $value || !is_numeric($value)) {
+            return null;
+        }
+
+        return (int) $value;
+    }
+
+    /**
+     * Do a search at Firefly III and return the ID of the group found.
+     */
+    private function searchField(string $field, string $value, ?int $accountId = null): ?array
+    {
+        $response       = $this->performSearch($field, $value, $accountId);
+        if (null === $response || 0 === $response->count()) {
             return null;
         }
         $first          = $response->current();
@@ -289,9 +305,89 @@ final class ApiSubmitter
     }
 
     /**
+     * Run the search/transactions query underlying searchField(), optionally scoped to
+     * a single account id (Firefly III's search language is AND-only, so this just adds
+     * an extra "account_id:X" term). Returns null on an HTTP error.
+     */
+    private function performSearch(string $field, string $value, ?int $accountId): ?GetTransactionsResponse
+    {
+        // search for the exact description and not just a part of it:
+        $searchModifier = config(sprintf('csv.search_modifier.%s', $field));
+        $query          = sprintf('%s:"%s"', $searchModifier, $value);
+        if (null !== $accountId) {
+            $query .= sprintf(' account_id:%d', $accountId);
+        }
+
+        Log::debug(sprintf('Going to search for %s:%s using query %s', $field, $value, $query));
+
+        $url            = SecretManager::getBaseUrl();
+        $token          = SecretManager::getAccessToken();
+        $request        = new GetSearchTransactionsRequest($url, $token);
+        $request->setTimeOut(config('importer.connection.timeout'));
+        $request->setVerify(config('importer.connection.verify'));
+        $request->setQuery($query);
+
+        try {
+            /** @var GetTransactionsResponse $response */
+            return $request->get();
+        } catch (ApiHttpException $e) {
+            Log::error(sprintf('[%s]: %s', config('importer.version'), $e->getMessage()));
+
+            return null;
+        }
+    }
+
+    /**
+     * Scoped duplicate detection cannot ask the count endpoint to filter by account (it
+     * has no such parameter), so when scoping is in effect this asks instead whether a
+     * deleted transaction with this value exists ANYWHERE in the ledger: compare the
+     * ledger-wide count (live + deleted) against a ledger-wide LIVE count. If the former
+     * is larger, a deleted duplicate exists somewhere and the transaction is skipped,
+     * exactly as the unscoped path already does today - scoping never gives a deleted
+     * duplicate on the same account a new way to slip through.
+     */
+    private function deletedTransactionExistsElsewhere(string $field, string $value): bool
+    {
+        $totalCount = $this->countFieldMatches($field, $value);
+        if (null === $totalCount) {
+            // API error: stay conservative, same as searchFieldUsingCount() does.
+            return true;
+        }
+        if (0 === $totalCount) {
+            return false;
+        }
+        $liveResponse = $this->performSearch($field, $value, null);
+        $liveCount    = $liveResponse?->count() ?? 0;
+        Log::debug(sprintf(
+            'Scoped duplicate detection: ledger-wide count (incl. deleted) for %s:%s is %d, ledger-wide live count is %d.',
+            $field,
+            $value,
+            $totalCount,
+            $liveCount
+        ));
+
+        return $totalCount > $liveCount;
+    }
+
+    /**
      * Do a search at Firefly III and return the ID of the group found.
      */
     private function searchFieldUsingCount(string $field, string $value): bool
+    {
+        $count = $this->countFieldMatches($field, $value);
+        if (null === $count) {
+            return true;
+        }
+        Log::debug(sprintf('The search returned count: %d', $count));
+
+        return $count > 0;
+    }
+
+    /**
+     * Query the search/transactions/count endpoint (ledger-wide, live + deleted, there is
+     * no account parameter) and return the count, or null on an HTTP error.
+     */
+    private function countFieldMatches(string $field, string $value): ?int
     {
         Log::debug(sprintf('Going to searchFieldUsingCount field "%s" with value "%s".', $field, $value));
 
@@ -331,14 +427,10 @@ final class ApiSubmitter
         } catch (ApiHttpException $e) {
             Log::error(sprintf('[%s]: %s', config('importer.version'), $e->getMessage()));
 
-            return true;
-        }
-        Log::debug(sprintf('The search returned count: %d', $response->getCount()));
-        if (0 === $response->getCount()) {
-            return false;
+            return null;
         }
 
-        return true;
+        return $response->getCount();
     }
 
     private function processTransaction(int $index, array $line, bool $lastTransaction): array

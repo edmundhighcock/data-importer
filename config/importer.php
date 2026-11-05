@@ -170,6 +170,13 @@ return [
     'is_external'                   => env('IS_EXTERNAL', false),
     'ignore_duplicate_errors'       => env('IGNORE_DUPLICATE_ERRORS', false),
     'ignore_not_found_transactions' => env('IGNORE_NOT_FOUND_TRANSACTIONS', false),
+    // "cell" duplicate detection (see ApiSubmitter::uniqueTransaction) normally searches
+    // for a matching external-id/description/etc. across the WHOLE Firefly III ledger.
+    // Some data sources (e.g. Lunch Flow) can give identical transactions on two
+    // different accounts the same identifier, so a ledger-wide search drops the second
+    // account's genuine transaction as a duplicate. When this is true, the search is
+    // scoped to the asset account the current transaction itself belongs to.
+    'duplicate_detection_scope_to_account' => env('DUPLICATE_DETECTION_SCOPE_TO_ACCOUNT', true),
     'namespace'                     => 'c40dcba2-411d-11ec-973a-0242ac130003',
     'use_cache'                     => env('USE_CACHE', false),
     'minimum_version'               => '6.6.0',
